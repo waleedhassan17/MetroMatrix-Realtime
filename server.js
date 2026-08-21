@@ -7,6 +7,7 @@ const { initSockets } = require('./src/sockets');
 const { roomKey } = require('./src/sockets/keys');
 const { getIO } = require('./src/sockets/io');
 const { assertJwtConfig } = require('./src/middleware/auth');
+const { assertInternalKeyConfig } = require('./src/middleware/internalAuth');
 const { verifySharedSchema } = require('./src/utils/verifySchema');
 const { startSweeper, closeAllOnShutdown } = require('./src/services/callService');
 
@@ -27,6 +28,9 @@ process.on('uncaughtException', (err) => {
   try {
     // Fail at boot on a missing secret rather than as a confusing 401 later.
     assertJwtConfig();
+    // Same reasoning for the server-to-server key: without it every room event
+    // the main backend publishes would 401, silently, in production.
+    assertInternalKeyConfig();
     await connectDB();
 
     // Confirms the shared collections exist and still carry the field names
