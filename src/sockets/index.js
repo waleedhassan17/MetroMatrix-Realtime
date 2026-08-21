@@ -3,6 +3,8 @@ const { socketAuth } = require('../middleware/auth');
 const { resolveRoom } = require('../utils/access');
 const registerChat = require('./chatHandler');
 const registerCall = require('./callHandler');
+const registerTracking = require('./trackingHandler');
+const { getLastLocation } = require('./trackingHandler');
 const { safeHandler } = require('./safeHandler');
 const { roomKey, userKey } = require('./keys');
 const { setIO, getIO, emitToRoom } = require('./io');
@@ -69,6 +71,12 @@ function initSockets(server) {
           roomType: access.roomType,
           role: access.role,
         });
+        // Replay the last known provider position to whoever just joined, so a
+        // customer opening live tracking mid-job gets a marker immediately
+        // rather than an empty map until the provider's next sample.
+        const lastLocation = getLastLocation(id);
+        if (lastLocation) socket.emit('provider_location_update', lastLocation);
+
         // The client's joinBooking() waits on this ack with a 5s timeout;
         // without it every join appeared to time out.
         return ack?.({ success: true, data: { roomType: access.roomType, role: access.role } });
@@ -82,6 +90,7 @@ function initSockets(server) {
 
     registerChat(io, socket);
     registerCall(io, socket);
+    registerTracking(io, socket);
 
     socket.on('disconnect', (reason) => {
       console.log(`[socket] disconnect user=${userId} sid=${socket.id} reason=${reason}`);
