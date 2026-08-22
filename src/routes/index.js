@@ -4,6 +4,7 @@ const { protect } = require('../middleware/auth');
 const { requireInternalKey } = require('../middleware/internalAuth');
 const chat = require('../controllers/chatController');
 const push = require('../controllers/pushController');
+const turn = require('../controllers/turnController');
 const { emitToRoom } = require('../sockets/io');
 
 const router = express.Router();
@@ -27,6 +28,10 @@ router.post('/chat/:roomId/messages', protect, chat.postMessage);
 
 router.post('/users/me/push-token', protect, push.savePushToken);
 router.delete('/users/me/push-token', protect, push.deletePushToken);
+
+// Short-lived ICE servers for a WebRTC call. Same user-JWT gate as chat —
+// minting a TURN credential costs relay bandwidth, so it is never anonymous.
+router.get('/turn/credentials', protect, turn.getTurnCredentials);
 
 // ============================================================================
 // INTERNAL: room-event bridge for the main backend.

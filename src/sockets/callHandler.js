@@ -163,7 +163,6 @@ module.exports = function registerCall(io, socket) {
           id: String(userId),
           role: access.role,
           name: caller.name,
-          phoneNumber: caller.phoneNumber,
         },
         at: new Date().toISOString(),
       };
@@ -213,7 +212,6 @@ module.exports = function registerCall(io, socket) {
           roomId: String(id),
           roomType: access.roomType,
           callerName: caller.name,
-          callerPhone: caller.phoneNumber,
         },
       }).catch(() => {});
 
@@ -226,9 +224,6 @@ module.exports = function registerCall(io, socket) {
             name: access.role === 'user'
               ? access.participants.counterpart.name
               : access.participants.user.name,
-            phoneNumber: access.role === 'user'
-              ? access.participants.counterpart.phoneNumber
-              : access.participants.user.phoneNumber,
           },
         },
       });
@@ -257,7 +252,6 @@ module.exports = function registerCall(io, socket) {
       }
 
       const peerId = peerOf(access);
-      const self = selfOf(access);
       const entry = {
         callId: String(callId),
         roomId: String(id),
@@ -269,17 +263,108 @@ module.exports = function registerCall(io, socket) {
       occupy(peerId, { ...entry, peerId: String(userId) });
 
       console.log(`[call] accept callId=${callId} room=${id} by=${userId}`);
-      // The accepter's number travels with the accept so the caller can hand
-      // off to the native dialer without a second round-trip.
+      // This used to carry the accepter's phone number so the caller could
+      // hand off to the native dialer. Media now flows peer-to-peer over
+      // WebRTC, so a phone number is no longer a connection mechanism: it
+      // stays on the CallLog for records and never leaves the server.
+      // The CALLER reacts to this event by creating the SDP offer.
       socket.to(roomKey(id)).emit('call_accept', {
         callId: String(callId),
         roomId: String(id),
         roomType: access.roomType,
         from: { id: String(userId), role: access.role },
-        peer: { phoneNumber: self.phoneNumber },
         at: now.toISOString(),
       });
       return ack?.({ success: true, data: { callId: String(callId) } });
+    })
+  );
+
+  // ==========================================================================
+  // WebRTC signalling relay.
+  //
+  // These three events carry the media negotiation between the two peers. The
+  // server is a DUMB PIPE here: it never parses SDP, never stores a candidate,
+  // and never inspects the payload beyond checking who is allowed to send it.
+  // That is deliberate — the moment the server understands the media it
+  // becomes a thing that can break the media.
+  //
+  // Authorization is doubled on purpose, matching terminate() above:
+  //   1. authorize()  — are you in this ROOM?
+  //   2. CallLog      — are you a party to THIS CALL?
+  // Room membership alone is not enough. A booking's customer and provider are
+  // both in the room permanently, so without the second check a participant
+  // could inject candidates into a call they are not part of, or hijack a
+  // negotiation by racing the real peer.
+  // ==========================================================================
+
+  /**
+   * @param {string} event    the event to forward under
+   * @param {object} payload  { callId, roomId|bookingId, roomType, ...frame }
+   * @param {object} frame    the media fields to forward (sdp / candidate)
+   */
+  async function relaySignal(event, payload, frame, ack) {
+    const { callId, roomId, bookingId, roomType } = payload;
+    const id = roomId || bookingId;
+
+    const access = await authorize(id, roomType);
+    if (!access) return ack?.({ success: false, message: 'Not a participant' });
+    if (!callId) return ack?.({ success: false, message: 'callId required' });
+
+    const log = await CallLog.findById(callId).select('participants status').lean();
+    if (!log || !log.participants.some((p) => String(p) === String(userId))) {
+      return ack?.({ success: false, message: 'Not a party to this call' });
+    }
+    // Negotiating a call that is already over would leave the peer with a
+    // half-open connection nothing will ever tear down.
+    if (log.status !== 'ring' && log.status !== 'accepted') {
+      return ack?.({ success: false, message: 'Call is no longer active' });
+    }
+
+    // socket.to() excludes the sender, so this reaches only the peer.
+    socket.to(roomKey(id)).emit(event, {
+      callId: String(callId),
+      roomId: String(id),
+      roomType: access.roomType,
+      from: { id: String(userId), role: access.role },
+      ...frame,
+    });
+    return ack?.({ success: true });
+  }
+
+  socket.on(
+    'webrtc_offer',
+    safeHandler('webrtc_offer', async (p, ack) => {
+      if (!p?.sdp) return ack?.({ success: false, message: 'sdp required' });
+      // Never log the SDP itself — it contains IP addresses and, with some
+      // configurations, identity material.
+      console.log(`[call] webrtc offer callId=${p.callId} from=${userId}`);
+      return relaySignal('webrtc_offer', p, { sdp: p.sdp }, ack);
+    })
+  );
+
+  socket.on(
+    'webrtc_answer',
+    safeHandler('webrtc_answer', async (p, ack) => {
+      if (!p?.sdp) return ack?.({ success: false, message: 'sdp required' });
+      console.log(`[call] webrtc answer callId=${p.callId} from=${userId}`);
+      return relaySignal('webrtc_answer', p, { sdp: p.sdp }, ack);
+    })
+  );
+
+  socket.on(
+    'webrtc_ice',
+    safeHandler('webrtc_ice', async (p, ack) => {
+      if (!p?.candidate) return ack?.({ success: false, message: 'candidate required' });
+      // Trickle ICE is bursty by nature, so this is throttled rather than
+      // unlimited (see utils/rateLimit.js). Unlike send_message a rejected
+      // candidate is not user-visible, so fail quietly: dropping one candidate
+      // costs a connectivity path, not the call.
+      if (!allow('webrtc_ice', userId)) {
+        return ack?.({ success: false, message: 'Too many candidates', throttled: true });
+      }
+      // Deliberately NOT logged per-candidate: a single call trickles dozens,
+      // and each one carries a private IP address.
+      return relaySignal('webrtc_ice', p, { candidate: p.candidate }, ack);
     })
   );
 

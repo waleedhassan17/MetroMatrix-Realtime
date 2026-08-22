@@ -8,6 +8,7 @@ const { roomKey } = require('./src/sockets/keys');
 const { getIO } = require('./src/sockets/io');
 const { assertJwtConfig } = require('./src/middleware/auth');
 const { assertInternalKeyConfig } = require('./src/middleware/internalAuth');
+const { assertTurnConfig } = require('./src/controllers/turnController');
 const { verifySharedSchema } = require('./src/utils/verifySchema');
 const { startSweeper, closeAllOnShutdown } = require('./src/services/callService');
 
@@ -31,6 +32,9 @@ process.on('uncaughtException', (err) => {
     // Same reasoning for the server-to-server key: without it every room event
     // the main backend publishes would 401, silently, in production.
     assertInternalKeyConfig();
+    // And for TURN: unset means calls cannot fetch ICE servers, but chat and
+    // signalling keep working — so warn, don't die.
+    assertTurnConfig();
     await connectDB();
 
     // Confirms the shared collections exist and still carry the field names

@@ -17,6 +17,13 @@ const LIMITS = {
   call_ring: { capacity: 5, refillPerSec: 5 / 60 },
   // Typing indicators are chatty by nature but must not become a fan-out amp.
   typing: { capacity: 30, refillPerSec: 5 },
+  // Trickle ICE arrives in a burst at connection setup — a dual-stack device
+  // on Wi-Fi plus cellular can legitimately produce 30-40 candidates in a
+  // couple of seconds — then goes quiet. Hence a large bucket with a modest
+  // refill: it absorbs the burst without letting a looping client relay
+  // forever. Without an entry here the event would be UNLIMITED, since
+  // allow() returns true for any name absent from this table.
+  webrtc_ice: { capacity: 120, refillPerSec: 20 },
 };
 
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;

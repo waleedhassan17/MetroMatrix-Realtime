@@ -43,13 +43,29 @@ const PERSON_FIELDS = 'fullName phoneNumber profilePhoto expoPushTokens';
 // typing, each call_* frame), so an unbounded cache would be a leak and no
 // cache costs 1-3 DB round-trips per keystroke-adjacent event.
 const CACHE_TTL_MS = 60 * 1000;
+
+// Denials expire far sooner than grants, and the asymmetry is the point.
+//
+// A grant is safe to hold: membership of a booking effectively never changes
+// once it exists. A DENIAL is different — it is usually "this booking did not
+// exist yet when you asked", and it becomes wrong the instant the booking is
+// created. Caching that for a full minute meant a customer who booked a
+// service and immediately tapped Call was told "Not a participant" for up to
+// 60 seconds, which reads as a broken feature rather than a stale cache.
+//
+// Five seconds still blunts a probing client (one DB lookup per room per 5s,
+// which is what the negative cache is actually for) while keeping the
+// book-then-call path feeling instant.
+const NEGATIVE_CACHE_TTL_MS = 5 * 1000;
+
 const CACHE_MAX = 5000;
 const cache = new Map(); // `${roomId}:${userId}` -> { at, value }
 
 function cacheGet(key) {
   const hit = cache.get(key);
   if (!hit) return undefined;
-  if (Date.now() - hit.at > CACHE_TTL_MS) {
+  const ttl = hit.value ? CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS;
+  if (Date.now() - hit.at > ttl) {
     cache.delete(key);
     return undefined;
   }
@@ -194,7 +210,8 @@ async function resolveRoom(roomId, userId, roomType) {
   }
 
   // Negative results are cached too — otherwise a probing client could force an
-  // unbounded stream of DB lookups.
+  // unbounded stream of DB lookups — but on a much shorter TTL, so a room that
+  // has just come into existence stops being denied almost immediately.
   cacheSet(key, result);
   return result;
 }
