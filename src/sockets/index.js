@@ -133,10 +133,15 @@ function initSockets(server) {
     registerCall(io, socket);
     registerTracking(io, socket);
 
-    socket.on('disconnect', (reason) => {
-      // Capture the rooms BEFORE deregistering: socket.rooms is still populated
-      // during the disconnect event but is gone immediately after, and these
-      // rooms are the only record of who needs to be told.
+    // 'disconnecting', NOT 'disconnect'.
+    //
+    // Socket.IO clears socket.rooms BEFORE it emits 'disconnect', so by then
+    // there is no record of which rooms this socket was in — and those rooms
+    // are the only way to know who needs to be told the user went offline.
+    // Doing this on 'disconnect' broadcast to an empty list and nobody ever
+    // heard about a clean sign-out. 'disconnecting' is the one moment where the
+    // membership still exists.
+    socket.on('disconnecting', () => {
       const rooms = [...socket.rooms].filter((r) => r !== socket.id && r !== userKey(userId));
 
       // Only on the true online -> offline transition. A second device still
@@ -146,7 +151,9 @@ function initSockets(server) {
         const update = presence.getPresence(userId);
         for (const room of rooms) io.to(room).emit('presence_update', update);
       }
+    });
 
+    socket.on('disconnect', (reason) => {
       console.log(`[socket] disconnect user=${userId} sid=${socket.id} reason=${reason}`);
     });
   });
