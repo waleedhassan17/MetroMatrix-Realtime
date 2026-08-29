@@ -83,6 +83,8 @@ All routes require `Authorization: Bearer <main-issued access token>`.
 | `GET` | `/api/health` | 503 when Mongo is down |
 | `GET` | `/api/chat/:roomId?roomType=&before=&limit=` | Cursor pagination; returns `hasMore`/`nextCursor` |
 | `POST` | `/api/chat/:roomId/messages` | Body `{ text }` or `{ message }` |
+| `GET` | `/api/conversations` | The inbox: every room the caller can reach, both verticals, either role |
+| `GET` | `/api/turn/credentials` | Short-lived Cloudflare ICE servers for a call |
 | `POST` | `/api/users/me/push-token` | `{ token }` — Expo format validated |
 | `DELETE` | `/api/users/me/push-token` | Call on logout |
 
@@ -92,8 +94,10 @@ All routes require `Authorization: Bearer <main-issued access token>`.
 are all byte-compatible. Added on top: `roomId`, `roomType`, `role`,
 `phoneNumber` on participants, and pagination.
 
-Participants carry phone numbers because calling hands off to the native dialer.
-`expoPushTokens` is stripped at the boundary and never leaves the server.
+Participants still carry `phoneNumber`, but it is no longer a connection
+mechanism — calling is peer-to-peer WebRTC now, not a dialer handoff. It remains
+for display and as a human fallback. `expoPushTokens` is stripped at the
+boundary and never leaves the server.
 
 ---
 
@@ -112,9 +116,13 @@ never learns whether the room exists.
 | `send_message` | `{ roomId, roomType?, text, clientMsgId? }` | `{ success, data: <message DTO> }` |
 | `typing` | `{ roomId, roomType?, isTyping }` | — |
 | `mark_read` | `{ roomId, roomType? }` | `{ success }` |
-| `call_ring` | `{ roomId, roomType? }` | `{ success, data: { callId, callee } }` or `{ success:false, reason:'busy'\|'rate_limited'\|'forbidden'\|'self' }` |
+| `presence_get` | `{ roomId, roomType? }` | `{ success, data: { roomId, userId, status, lastSeen } }` — the **counterpart's** presence |
+| `call_ring` | `{ roomId, roomType? }` | `{ success, data: { callId, callee } }` or `{ success:false, reason:'busy'\|'unavailable'\|'rate_limited'\|'forbidden'\|'self' }` |
+| `call_ringing` | `{ callId, roomId }` | `{ success }` — **callee only**; proves the call is being presented |
 | `call_accept` | `{ callId, roomId }` | `{ success }` |
 | `call_decline` / `call_end` | `{ callId, roomId }` | `{ success }` |
+| `webrtc_offer` / `webrtc_answer` | `{ callId, roomId, sdp }` | `{ success }` |
+| `webrtc_ice` | `{ callId, roomId, candidate }` | `{ success }` (throttled) |
 
 `bookingId` is accepted as an alias for `roomId` everywhere.
 
@@ -125,11 +133,15 @@ never learns whether the room exists.
 | `new_message` | room | message DTO (`{ id, text, sender, timestamp, status }`) |
 | `typing` | room (others) | `{ roomId, bookingId, userId, isTyping }` |
 | `messages_read` (+ legacy `read`) | room | `{ roomId, by }` |
-| `call_ring` | callee's personal room + conversation room | `{ callId, roomId, roomType, from: { id, role, name, phoneNumber } }` |
-| `call_accept` | room | `{ callId, from, peer: { phoneNumber } }` |
+| `presence_update` | room | `{ userId, status: 'online'\|'offline', lastSeen }` |
+| `call_ring` | callee's personal room + conversation room | `{ callId, roomId, roomType, from: { id, role, name } }` |
+| `call_ringing` | caller's personal room | `{ callId, roomId, roomType }` — their device is presenting it |
+| `call_accept` | room | `{ callId, from }` |
 | `call_decline` / `call_end` | room | `{ callId, from, reason }` |
 | `call_missed` | both parties | `{ callId, roomId }` |
 | **`call_busy`** | **caller only** | `{ roomId, calleeId }` |
+| **`call_unavailable`** | **caller only** | `{ roomId, calleeId }` — callee has no live socket |
+| `webrtc_offer` / `webrtc_answer` / `webrtc_ice` | peer | relayed verbatim, never inspected |
 | `token_expired` | socket | sent before disconnecting an expired session |
 | `server_shutdown` | all | `{ reconnectInMs }` — dyno cycling |
 
@@ -141,11 +153,35 @@ on `id`, and a raw document has `_id`.
 
 ---
 
-## Calling: signalling only
+## Calling: signalling here, media peer-to-peer
 
-`ring / accept / decline / end` coordinate the two apps. **The audio is the
-phone's native dialer** (`tel:`). No WebRTC, no Agora, no Twilio, no native
-modules — the app stays in Expo's managed workflow.
+`ring / accept / decline / end` coordinate the two apps over the socket. **The
+audio and video flow peer-to-peer over WebRTC**, relayed through Cloudflare TURN
+only when a direct path is impossible. This service relays SDP and ICE as a dumb
+pipe: it never parses an offer, never stores a candidate, and never logs either
+(both carry IP addresses). Short-lived ICE servers come from
+`GET /api/turn/credentials`; the Cloudflare token stays in this service's env and
+never reaches a client.
+
+This replaced a `tel:` handoff to the phone's native dialer. Both sides invoked
+it independently, so two phones opened two dialers and no call ever connected
+in-app.
+
+### Calling vs ringing
+
+`call_ring` checks two things before anything rings, in order:
+
+1. **Busy** — is the callee already on a call?  → `call_busy`
+2. **Presence** — does the callee have a live socket? → `call_unavailable`
+
+Without the second check a callee with the app closed was rung into an empty
+personal room, and the caller watched "Ringing…" for the full 30 seconds before
+being told "No answer" — describing a phone that never rang. A push still fires
+on `unavailable`: no live socket means backgrounded, not unreachable.
+
+The caller's UI shows **"Calling…"** until the callee's device emits
+`call_ringing`, and only then **"Ringing…"**. `call_ringing` is accepted from the
+callee alone, so a caller cannot manufacture the reassurance it provides.
 
 ### Busy signal — and its one real limitation
 
@@ -155,12 +191,30 @@ when a socket died mid-call, bounded by a staleness floor so a crash cannot wedg
 someone busy forever. A boot sweeper and the SIGTERM path close out orphans.
 
 **This is app-level busy only.** It cannot detect that the callee is on an
-ordinary phone call placed outside the app — including the native leg of a call
-this service brokered, if the app is killed after the dialer takes over. That is
-an unavoidable consequence of the native-dialer design: the OS does not report
-system call state to a React Native app without CallKit / ConnectionService.
-When the callee is on an unrelated cellular call the ring still goes through and
-the carrier handles it.
+ordinary cellular call placed outside the app — the OS does not report system
+call state to a React Native app without CallKit / ConnectionService.
+
+---
+
+## Presence
+
+`services/presence.js` holds `Map<userId, Set<socketId>>`, maintained from the
+authenticated connect and disconnect handlers. A user is online while any socket
+remains, so a second device or a reconnect that overlaps the dying socket never
+flaps them offline; `presence_update` is broadcast only on a real transition.
+
+**There is no application heartbeat.** Socket.IO's engine ping already runs at
+`pingInterval` 25s / `pingTimeout` 20s, so a device that dies without closing its
+socket is reaped in ~45s and lands in the normal disconnect path. An app-level
+ping would duplicate the transport's job without detecting anything sooner.
+
+`presence_get` is scoped to a **room**, not a list of user ids, so `resolveRoom`'s
+existing authorization covers it: you may ask about exactly one person, the one
+you are already allowed to talk to.
+
+`lastSeen` is in-memory and does not survive a dyno restart — a user last seen
+before the restart reads as offline with no time, which clients render as plain
+"Offline".
 
 Unanswered rings are marked `missed` after 30s.
 
