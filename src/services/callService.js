@@ -4,24 +4,26 @@ const CallLog = require('../models/CallLog');
 // Call state.
 //
 // NO MEDIA PASSES THROUGH THIS SERVICE. ring / accept / decline / end travel
-// over the socket purely to coordinate the two apps; the actual audio is handed
-// to the phone's native dialer via a `tel:` URL on the client. There is no
-// WebRTC, no Agora, no Twilio.
+// over the socket purely to coordinate the two apps; the audio and video flow
+// peer-to-peer over WebRTC, relayed through Cloudflare TURN only when a direct
+// path is impossible. This service relays SDP and ICE blind (see
+// sockets/callHandler.js) and never inspects them.
 //
 // ---------------------------------------------------------------------------
 // THE BUSY SIGNAL AND ITS ONE REAL LIMITATION
 // ---------------------------------------------------------------------------
 // `activeCalls` tracks calls THIS SERVICE knows about. That is APP-LEVEL BUSY
-// ONLY. It CANNOT detect that the callee is on an ordinary phone call placed
-// outside the app — including the native leg of a call this service itself
-// brokered, if the app is killed after the dialer takes over.
+// ONLY. It CANNOT detect that the callee is on an ordinary cellular call placed
+// outside the app.
 //
-// That is an unavoidable consequence of the native-dialer design: the OS does
-// not report system phone-call state to a React Native app without native
-// modules (CallKit / ConnectionService), which this project deliberately does
-// not use. When the callee is on an unrelated cellular call the ring still goes
-// through and the carrier handles it — the caller hears the network's busy tone
-// once the dialer connects.
+// The OS does not report system phone-call state to a React Native app without
+// native modules (CallKit / ConnectionService), which this project does not yet
+// use. When the callee is on an unrelated cellular call the in-app ring still
+// goes through and their phone shows both.
+//
+// Note that busy is a different question from PRESENCE (services/presence.js).
+// Busy asks "is this user already on a call?"; presence asks "is this user
+// connected at all?". call_ring checks both, in that order.
 //
 // BUSY BEGINS AT RING, NOT AT ACCEPT. If it only began at accept, two callers
 // could ring the same callee simultaneously and both would get through, and a

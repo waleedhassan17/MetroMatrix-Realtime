@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const CallLog = require('../models/CallLog');
-const { resolveRoom } = require('../utils/access');
+const { resolveRoom, counterpartOf, selfOf } = require('../utils/access');
+const { isOnline } = require('../services/presence');
 const { sendPush } = require('../utils/push');
 const { allow } = require('../utils/rateLimit');
 const { safeHandler } = require('./safeHandler');
@@ -35,13 +36,7 @@ function clearRing(callId) {
 
 /** The other party's id — always the id THEIR socket authenticates with. */
 function peerOf(access) {
-  return access.role === 'user'
-    ? access.participants.counterpart.id
-    : access.participants.user.id;
-}
-
-function selfOf(access) {
-  return access.role === 'user' ? access.participants.user : access.participants.counterpart;
+  return counterpartOf(access).id;
 }
 
 module.exports = function registerCall(io, socket) {
@@ -131,6 +126,60 @@ module.exports = function registerCall(io, socket) {
         return ack?.({ success: false, reason: 'busy', message: 'On another call' });
       }
 
+      // ---------------------------------------------------------------------
+      // Is the callee actually reachable over a socket?
+      //
+      // Without this the ring was emitted into an empty personal room, nobody
+      // answered because nobody heard it, and 30 seconds later the caller was
+      // told "No answer" — having watched "Ringing…" the whole time for a
+      // device that was never rung. Fail fast and say so instead.
+      //
+      // The push below still fires: "no live socket" means backgrounded or
+      // killed, not unreachable. It is the caller's UI that must stop lying,
+      // not the callee's notification that should stop being sent.
+      // ---------------------------------------------------------------------
+      if (!isOnline(calleeId)) {
+        console.log(`[call] unavailable room=${id} caller=${userId} callee=${calleeId}`);
+        await CallLog.create({
+          roomId: id,
+          roomType: access.roomType,
+          from: userId,
+          to: calleeId,
+          fromRole: access.role,
+          participants: [userId, calleeId],
+          status: 'unavailable',
+          endReason: 'offline',
+          endedAt: new Date(),
+        });
+
+        const calleeTokens = counterpartOf(access).expoPushTokens;
+        sendPush(calleeTokens, {
+          title: 'Missed call',
+          body: `${caller.name || 'Someone'} tried to call you`,
+          channelId: 'calls',
+          data: {
+            type: 'call',
+            roomId: String(id),
+            roomType: access.roomType,
+            callerName: caller.name,
+          },
+        }).catch(() => {});
+
+        // Caller's socket ONLY — same reasoning as call_busy: broadcasting to
+        // the room would announce a ring that never happened.
+        socket.emit('call_unavailable', {
+          roomId: String(id),
+          roomType: access.roomType,
+          calleeId: String(calleeId),
+          at: new Date().toISOString(),
+        });
+        return ack?.({
+          success: false,
+          reason: 'unavailable',
+          message: 'User unavailable',
+        });
+      }
+
       // Mint the id before the write so it can go out on the wire immediately.
       const callId = new mongoose.Types.ObjectId();
       await CallLog.create({
@@ -198,11 +247,7 @@ module.exports = function registerCall(io, socket) {
       );
 
       // Best-effort — wakes the callee when the app is backgrounded or killed.
-      const calleeTokens =
-        access.role === 'user'
-          ? access.participants.counterpart.expoPushTokens
-          : access.participants.user.expoPushTokens;
-      sendPush(calleeTokens, {
+      sendPush(counterpartOf(access).expoPushTokens, {
         title: 'Incoming call',
         body: `${caller.name || 'Someone'} is calling you`,
         channelId: 'calls',
@@ -219,12 +264,7 @@ module.exports = function registerCall(io, socket) {
         success: true,
         data: {
           callId: String(callId),
-          callee: {
-            id: String(calleeId),
-            name: access.role === 'user'
-              ? access.participants.counterpart.name
-              : access.participants.user.name,
-          },
+          callee: { id: String(calleeId), name: counterpartOf(access).name },
         },
       });
     })
@@ -276,6 +316,46 @@ module.exports = function registerCall(io, socket) {
         at: now.toISOString(),
       });
       return ack?.({ success: true, data: { callId: String(callId) } });
+    })
+  );
+
+  // ==========================================================================
+  // Delivery acknowledgement.
+  //
+  // The callee's device emits this the moment it actually presents an incoming
+  // call. It is the ONLY thing that moves the caller from "Calling…" to
+  // "Ringing…", and that distinction is the whole point: before this existed
+  // the caller's UI said "Ringing…" the instant they pressed call, which was a
+  // guess, and the guess was wrong exactly when it mattered — a callee whose
+  // app was closed, or whose ring frame was lost.
+  //
+  // Only the callee (`to` on the CallLog) can send it. Otherwise a caller could
+  // emit it at themselves and manufacture the very reassurance this provides.
+  // ==========================================================================
+  socket.on(
+    'call_ringing',
+    safeHandler('call_ringing', async ({ callId, roomId, bookingId, roomType }, ack) => {
+      const id = roomId || bookingId;
+      const access = await authorize(id, roomType);
+      if (!access) return ack?.({ success: false, message: 'Not a participant' });
+      if (!callId) return ack?.({ success: false, message: 'callId required' });
+
+      const log = await CallLog.findById(callId).select('from to status').lean();
+      if (!log || String(log.to) !== String(userId)) {
+        return ack?.({ success: false, message: 'Not the callee for this call' });
+      }
+      if (log.status !== 'ring') {
+        return ack?.({ success: false, message: 'Call is no longer ringing' });
+      }
+
+      console.log(`[call] ringing ack callId=${callId} room=${id} callee=${userId}`);
+      io.to(userKey(log.from)).emit('call_ringing', {
+        callId: String(callId),
+        roomId: String(id),
+        roomType: access.roomType,
+        at: new Date().toISOString(),
+      });
+      return ack?.({ success: true });
     })
   );
 

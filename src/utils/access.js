@@ -216,4 +216,22 @@ async function resolveRoom(roomId, userId, roomType) {
   return result;
 }
 
-module.exports = { resolveRoom, invalidateRoom, ROOM_TYPES };
+/**
+ * The OTHER party in a resolved room, as a shaped person.
+ *
+ * `participants.user` is always the customer/patient and `participants.counterpart`
+ * always the provider/doctor, so which one is "the other person" depends on the
+ * caller's own role. Getting this backwards routes rings and presence to the
+ * person who asked, which is why it lives here rather than being rewritten at
+ * each call site.
+ */
+function counterpartOf(access) {
+  return access.role === 'user' ? access.participants.counterpart : access.participants.user;
+}
+
+/** The caller themselves, as a shaped person. */
+function selfOf(access) {
+  return access.role === 'user' ? access.participants.user : access.participants.counterpart;
+}
+
+module.exports = { resolveRoom, invalidateRoom, counterpartOf, selfOf, ROOM_TYPES };

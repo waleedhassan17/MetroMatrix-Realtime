@@ -45,19 +45,34 @@ const CallLogSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      // ring     → dialing, callee notified
-      // accepted → callee picked up (native dialer handoff happens client-side)
-      // declined → callee actively rejected
-      // missed   → ring timed out with no answer
-      // busy     → callee was already on another in-app call
-      // ended    → normal hang-up after accept
-      enum: ['ring', 'accepted', 'declined', 'missed', 'busy', 'ended'],
+      // ring        → dialing, callee notified
+      // accepted    → callee picked up; media negotiates peer-to-peer over WebRTC
+      // declined    → callee actively rejected
+      // missed      → ring timed out with no answer
+      // busy        → callee was already on another in-app call
+      // unavailable → callee had no live socket, so was never rung at all
+      // ended       → normal hang-up after accept
+      //
+      // 'unavailable' is deliberately distinct from 'missed'. Missed means the
+      // callee's device rang and nobody picked up; unavailable means it never
+      // rang, because they were not connected. Collapsing them would tell the
+      // caller their call was ignored when in fact it was never delivered.
+      enum: ['ring', 'accepted', 'declined', 'missed', 'busy', 'unavailable', 'ended'],
       default: 'ring',
       index: true,
     },
     endReason: {
       type: String,
-      enum: ['hangup', 'timeout', 'peer_disconnect', 'server_restart', 'stale', 'busy', null],
+      enum: [
+        'hangup',
+        'timeout',
+        'peer_disconnect',
+        'server_restart',
+        'stale',
+        'busy',
+        'offline',
+        null,
+      ],
       default: null,
     },
 

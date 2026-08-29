@@ -1,6 +1,7 @@
 const { Server } = require('socket.io');
 const { socketAuth } = require('../middleware/auth');
-const { resolveRoom } = require('../utils/access');
+const { resolveRoom, counterpartOf } = require('../utils/access');
+const presence = require('../services/presence');
 const registerChat = require('./chatHandler');
 const registerCall = require('./callHandler');
 const registerTracking = require('./trackingHandler');
@@ -50,7 +51,14 @@ function initSockets(server) {
     // Personal room — lets the server ring this user on whatever screen they
     // are on, and lets call_busy reach one specific caller.
     socket.join(userKey(userId));
-    console.log(`[socket] connect user=${userId} sid=${socket.id}`);
+
+    // Presence is recorded here, but NOT broadcast here: at this instant the
+    // socket is in no booking room, so there is nobody to tell. The room join
+    // below is the first moment a counterpart exists to notify.
+    const cameOnline = presence.register(userId, socket.id);
+    console.log(
+      `[socket] connect user=${userId} sid=${socket.id}${cameOnline ? ' (now online)' : ''}`
+    );
 
     socket.on(
       'join_booking',
@@ -71,6 +79,16 @@ function initSockets(server) {
           roomType: access.roomType,
           role: access.role,
         });
+        // Tell the room this user is here. Connecting alone could not announce
+        // this — the socket had joined no rooms yet — so this join IS the
+        // "came online" moment from the counterpart's point of view.
+        socket.to(roomKey(id)).emit('presence_update', presence.getPresence(userId));
+
+        // And tell the joiner about the OTHER party, so a screen opening onto
+        // an already-connected counterpart renders the truth immediately
+        // instead of assuming online until something contradicts it.
+        socket.emit('presence_update', presence.getPresence(counterpartOf(access).id));
+
         // Replay the last known provider position to whoever just joined, so a
         // customer opening live tracking mid-job gets a marker immediately
         // rather than an empty map until the provider's next sample.
@@ -88,11 +106,47 @@ function initSockets(server) {
       if (id) socket.leave(roomKey(id));
     });
 
+    // Point query for the counterpart's presence — what a chat header needs on
+    // mount, before any transition has happened to broadcast.
+    //
+    // Deliberately scoped to a ROOM rather than taking a list of user ids: the
+    // room is what resolveRoom already authorizes, so this cannot be used to
+    // probe whether an arbitrary user is online. You may ask about exactly one
+    // person — the one you are already allowed to talk to.
+    socket.on(
+      'presence_get',
+      safeHandler('presence_get', async ({ roomId, bookingId, roomType }, ack) => {
+        const id = roomId || bookingId;
+        const access = await resolveRoom(id, userId, roomType);
+        if (!access) return ack?.({ success: false, message: 'Not a participant' });
+        return ack?.({
+          success: true,
+          data: {
+            roomId: String(id),
+            ...presence.getPresence(counterpartOf(access).id),
+          },
+        });
+      })
+    );
+
     registerChat(io, socket);
     registerCall(io, socket);
     registerTracking(io, socket);
 
     socket.on('disconnect', (reason) => {
+      // Capture the rooms BEFORE deregistering: socket.rooms is still populated
+      // during the disconnect event but is gone immediately after, and these
+      // rooms are the only record of who needs to be told.
+      const rooms = [...socket.rooms].filter((r) => r !== socket.id && r !== userKey(userId));
+
+      // Only on the true online -> offline transition. A second device still
+      // connected, or a reconnect that briefly overlapped this socket, means
+      // the user never actually left.
+      if (presence.deregister(userId, socket.id)) {
+        const update = presence.getPresence(userId);
+        for (const room of rooms) io.to(room).emit('presence_update', update);
+      }
+
       console.log(`[socket] disconnect user=${userId} sid=${socket.id} reason=${reason}`);
     });
   });

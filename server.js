@@ -11,6 +11,7 @@ const { assertInternalKeyConfig } = require('./src/middleware/internalAuth');
 const { assertTurnConfig } = require('./src/controllers/turnController');
 const { verifySharedSchema } = require('./src/utils/verifySchema');
 const { startSweeper, closeAllOnShutdown } = require('./src/services/callService');
+const presence = require('./src/services/presence');
 
 const PORT = process.env.PORT || 5000;
 
@@ -73,6 +74,9 @@ process.on('uncaughtException', (err) => {
         // the busy fallback marks those users unreachable until the stale
         // sweeper catches them two hours later.
         await closeAllOnShutdown(io, roomKey);
+        // Everyone is about to lose their socket. Stamp them last-seen-now so
+        // the timestamps stay truthful for the seconds before this process dies.
+        presence.clearAllOnShutdown();
       } catch (e) {
         console.error('[shutdown] call closeout failed:', e.message);
       }
