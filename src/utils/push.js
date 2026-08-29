@@ -38,14 +38,38 @@ async function pruneTokens(deadTokens) {
   console.log(`[push] pruned ${deadTokens.length} dead token(s)`);
 }
 
+// An unset EXPO_ACCESS_TOKEN is not a soft degradation: with Expo's push
+// security enabled, EVERY send is rejected with InvalidCredentials and not one
+// notification is delivered. That failed silently as a per-ticket warning
+// buried in the logs. Say it once, loudly, at the first send.
+let warnedMissingCredentials = false;
+
+function authHeader() {
+  const token = process.env.EXPO_ACCESS_TOKEN;
+  if (token) return { Authorization: `Bearer ${token}` };
+  if (!warnedMissingCredentials) {
+    warnedMissingCredentials = true;
+    console.error(
+      '[push] EXPO_ACCESS_TOKEN is not set — if this Expo project enforces push ' +
+        'security every notification will be rejected as InvalidCredentials. ' +
+        'Set it with: heroku config:set EXPO_ACCESS_TOKEN=<token>'
+    );
+  }
+  return {};
+}
+
 /**
  * Best-effort push. NEVER throws — a failed notification must not fail the
  * message or call that triggered it.
  *
  * @param {string[]} tokens
- * @param {{title:string, body:string, data:object, channelId?:string}} payload
+ * @param {{title:string, body:string, data:object, channelId?:string,
+ *          ttlSeconds?:number, collapseKey?:string, categoryId?:string}} payload
  */
-async function sendPush(tokens, { title, body, data, channelId = 'messages' }) {
+async function sendPush(
+  tokens,
+  { title, body, data, channelId = 'messages', ttlSeconds, collapseKey, categoryId }
+) {
   const list = [...new Set((tokens || []).filter(Boolean))];
   if (!list.length) return;
 
@@ -56,9 +80,7 @@ async function sendPush(tokens, { title, body, data, channelId = 'messages' }) {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          ...(process.env.EXPO_ACCESS_TOKEN
-            ? { Authorization: `Bearer ${process.env.EXPO_ACCESS_TOKEN}` }
-            : {}),
+          ...authHeader(),
         },
         body: JSON.stringify(
           group.map((to) => ({
@@ -66,10 +88,24 @@ async function sendPush(tokens, { title, body, data, channelId = 'messages' }) {
             title,
             body,
             data,
+            // The CHANNEL carries the ringtone on Android, not this field — a
+            // channel's sound is fixed at creation and cannot be overridden per
+            // notification. This is what iOS uses, and the Android fallback if
+            // the channel is somehow missing.
             sound: 'default',
-            // 'calls' is the ringtone-style channel; 'messages' is quieter.
             channelId,
             priority: 'high',
+            // A ring is worthless late: an expired call notification arriving
+            // an hour afterwards is just confusing. Messages tolerate a delay.
+            ...(ttlSeconds ? { ttl: ttlSeconds } : {}),
+            // Collapse replaces the previous notification with the same key
+            // instead of stacking. Twenty messages in one thread should be one
+            // entry, not twenty.
+            ...(collapseKey ? { collapseId: collapseKey } : {}),
+            // Notification category — drives the Accept/Decline action buttons.
+            ...(categoryId ? { categoryId } : {}),
+            // iOS: put a call through a Focus/Do-Not-Disturb.
+            ...(channelId.startsWith('calls') ? { interruptionLevel: 'time-sensitive' } : {}),
           }))
         ),
       });

@@ -3,6 +3,7 @@ const CallLog = require('../models/CallLog');
 const { resolveRoom, counterpartOf, selfOf } = require('../utils/access');
 const { isOnline } = require('../services/presence');
 const { sendPush } = require('../utils/push');
+const { CALLS_CHANNEL, MESSAGES_CHANNEL } = require('../utils/pushChannels');
 const { allow } = require('../utils/rateLimit');
 const { safeHandler } = require('./safeHandler');
 const { roomKey, userKey } = require('./keys');
@@ -127,18 +128,24 @@ module.exports = function registerCall(io, socket) {
       }
 
       // ---------------------------------------------------------------------
-      // Is the callee actually reachable over a socket?
+      // Is the callee reachable AT ALL — by socket, or failing that by push?
       //
-      // Without this the ring was emitted into an empty personal room, nobody
-      // answered because nobody heard it, and 30 seconds later the caller was
-      // told "No answer" — having watched "Ringing…" the whole time for a
-      // device that was never rung. Fail fast and say so instead.
+      // "No live socket" does NOT mean unreachable. A backgrounded or killed
+      // app has no socket and is exactly the case a ring most needs to reach:
+      // a phone in someone's pocket. Treating that as `unavailable` meant a
+      // closed app could never be rung, which is most of what "calls don't
+      // notify me" amounts to.
       //
-      // The push below still fires: "no live socket" means backgrounded or
-      // killed, not unreachable. It is the caller's UI that must stop lying,
-      // not the callee's notification that should stop being sent.
+      // So only a callee with NEITHER a socket NOR a push token is genuinely
+      // unavailable. Everyone else gets a real, ringing call: a live CallLog, a
+      // ring timer, and a high-priority push carrying the callId so tapping it
+      // can answer. The caller sits on "Calling…" until the callee's device
+      // acknowledges with call_ringing — which the push-tap path emits too.
       // ---------------------------------------------------------------------
-      if (!isOnline(calleeId)) {
+      const calleeTokens = counterpartOf(access).expoPushTokens || [];
+      const calleeOnline = isOnline(calleeId);
+
+      if (!calleeOnline && !calleeTokens.length) {
         console.log(`[call] unavailable room=${id} caller=${userId} callee=${calleeId}`);
         await CallLog.create({
           roomId: id,
@@ -151,19 +158,6 @@ module.exports = function registerCall(io, socket) {
           endReason: 'offline',
           endedAt: new Date(),
         });
-
-        const calleeTokens = counterpartOf(access).expoPushTokens;
-        sendPush(calleeTokens, {
-          title: 'Missed call',
-          body: `${caller.name || 'Someone'} tried to call you`,
-          channelId: 'calls',
-          data: {
-            type: 'call',
-            roomId: String(id),
-            roomType: access.roomType,
-            callerName: caller.name,
-          },
-        }).catch(() => {});
 
         // Caller's socket ONLY — same reasoning as call_busy: broadcasting to
         // the room would announce a ring that never happened.
@@ -237,22 +231,52 @@ module.exports = function registerCall(io, socket) {
           io.to(userKey(calleeId)).emit('call_missed', missed);
           io.to(userKey(userId)).emit('call_missed', missed);
           io.to(roomKey(id)).emit('call_end', { ...missed, reason: 'timeout' });
+
+          // Past tense, and correct here: the ring genuinely happened and
+          // nobody answered. Reuses the ring's collapse key so it REPLACES the
+          // now-dead "Incoming call" notification rather than sitting beneath
+          // it — otherwise the callee finds a ringing call they cannot answer.
+          sendPush(calleeTokens, {
+            title: 'Missed call',
+            body: `${caller.name || 'Someone'} tried to call you`,
+            channelId: MESSAGES_CHANNEL,
+            collapseKey: `call:${id}`,
+            data: {
+              type: 'missed_call',
+              roomId: String(id),
+              roomType: access.roomType,
+              callerName: caller.name,
+            },
+          }).catch(() => {});
         }
       }, RING_TIMEOUT_MS);
       if (timer.unref) timer.unref();
       ringTimers.set(String(callId), timer);
 
       console.log(
-        `[call] ring callId=${callId} room=${id} type=${access.roomType} caller=${userId} callee=${calleeId}`
+        `[call] ring callId=${callId} room=${id} type=${access.roomType} ` +
+          `caller=${userId} callee=${calleeId} socket=${calleeOnline}`
       );
 
-      // Best-effort — wakes the callee when the app is backgrounded or killed.
-      sendPush(counterpartOf(access).expoPushTokens, {
+      // Wakes a backgrounded or killed callee. This is the ONLY thing that can
+      // ring a phone whose app is not running, so it is not optional garnish.
+      sendPush(calleeTokens, {
         title: 'Incoming call',
         body: `${caller.name || 'Someone'} is calling you`,
-        channelId: 'calls',
+        channelId: CALLS_CHANNEL,
+        // Expires with the ring itself. A call notification that lands after
+        // the caller has given up is noise, and worse, tapping it would try to
+        // answer a call that is already over.
+        ttlSeconds: Math.ceil(RING_TIMEOUT_MS / 1000),
+        // One entry per room: a second attempt replaces the first rather than
+        // leaving a stack of dead rings in the shade.
+        collapseKey: `call:${id}`,
+        categoryId: 'incoming_call',
         data: {
           type: 'call',
+          // LOAD-BEARING. The app drops any call notification without a callId
+          // (useNotificationRouting), because it cannot answer a call it cannot
+          // name. Every call push must carry it.
           callId: String(callId),
           roomId: String(id),
           roomType: access.roomType,

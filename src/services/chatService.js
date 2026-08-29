@@ -1,7 +1,8 @@
 const ChatMessage = require('../models/ChatMessage');
 const { sendPush } = require('../utils/push');
 const { toChatMessageDTO } = require('../utils/serialize');
-const { emitToRoom } = require('../sockets/io');
+const { emitToRoom, isUserInRoom } = require('../sockets/io');
+const { MESSAGES_CHANNEL } = require('../utils/pushChannels');
 
 // ============================================================================
 // The SINGLE message-delivery path, shared by the socket handler and the REST
@@ -57,13 +58,41 @@ async function deliverMessage({ access, senderId, text, clientMsgId }) {
   const sender =
     access.role === 'user' ? access.participants.user : access.participants.counterpart;
 
-  // Best-effort — a push failure must never fail the message.
-  sendPush(recipient.expoPushTokens, {
-    title: sender.name || 'New message',
-    body: text.length > 120 ? `${text.slice(0, 117)}...` : text,
-    channelId: 'messages',
-    data: { type: 'message', roomId: String(access.roomId), roomType: access.roomType },
-  }).catch(() => {});
+  // ---------------------------------------------------------------------
+  // Notify — unless they are already looking at this conversation.
+  //
+  // This send used to be unconditional, so a recipient with the thread open
+  // got a banner and a sound on top of the message they had just watched
+  // appear. That is the single most irritating notification bug there is, and
+  // it trains people to mute the app.
+  //
+  // The test is room membership, NOT presence: someone connected but on the
+  // bookings list absolutely should be told. Only the person reading this exact
+  // thread is spared. Failure is treated as "not in the room", so an error
+  // notifies — a duplicate is a nuisance, a missing message is a real loss.
+  // ---------------------------------------------------------------------
+  isUserInRoom(access.roomId, recipient.id)
+    .then((reading) => {
+      if (reading) return;
+      return sendPush(recipient.expoPushTokens, {
+        title: sender.name || 'New message',
+        body: text.length > 120 ? `${text.slice(0, 117)}...` : text,
+        channelId: MESSAGES_CHANNEL,
+        // One entry per conversation. Twenty messages should update a single
+        // notification, not bury the phone in twenty.
+        collapseKey: `chat:${access.roomId}`,
+        // A day. Past that the message is better found in the app than as a
+        // notification arriving out of nowhere.
+        ttlSeconds: 86400,
+        data: {
+          type: 'message',
+          roomId: String(access.roomId),
+          roomType: access.roomType,
+        },
+      });
+    })
+    // Best-effort — a push failure must never fail the message.
+    .catch(() => {});
 
   return { dto, duplicate: false };
 }
