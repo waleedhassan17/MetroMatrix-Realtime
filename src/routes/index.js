@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const { protect } = require('../middleware/auth');
 const { requireInternalKey } = require('../middleware/internalAuth');
 const chat = require('../controllers/chatController');
+const conversations = require('../controllers/conversationsController');
 const push = require('../controllers/pushController');
 const turn = require('../controllers/turnController');
 const { emitToRoom } = require('../sockets/io');
@@ -25,6 +26,9 @@ router.get('/health', (req, res) => {
 // ?roomType=healthcare for appointments; it defaults to homeservice.
 router.get('/chat/:roomId', protect, chat.getChatData);
 router.post('/chat/:roomId/messages', protect, chat.postMessage);
+
+// The inbox: every room the caller can reach, both verticals, either role.
+router.get('/conversations', protect, conversations.getConversations);
 
 router.post('/users/me/push-token', protect, push.savePushToken);
 router.delete('/users/me/push-token', protect, push.deletePushToken);
