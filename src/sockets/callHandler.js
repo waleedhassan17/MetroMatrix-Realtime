@@ -87,7 +87,7 @@ module.exports = function registerCall(io, socket) {
 
   socket.on(
     'call_ring',
-    safeHandler('call_ring', async ({ roomId, bookingId, roomType }, ack) => {
+    safeHandler('call_ring', async ({ roomId, bookingId, roomType, media }, ack) => {
       const id = roomId || bookingId; // bookingId accepted for older clients
       if (!allow('call_ring', userId)) {
         return ack?.({ success: false, message: 'Too many call attempts', reason: 'rate_limited' });
@@ -198,10 +198,20 @@ module.exports = function registerCall(io, socket) {
       occupy(userId, { ...entry, peerId: String(calleeId) });
       occupy(calleeId, { ...entry, peerId: String(userId) });
 
+      // WHAT KIND OF CALL THIS IS.
+      //
+      // The payload carried no media type, so the callee could only infer it
+      // from roomType — healthcare meaning video. That is right for a
+      // consultation and wrong for a doctor placing a voice call, and the two
+      // sides would silently disagree about whether a camera should be on.
+      // The caller knows; relay it.
+      const callMedia = media === 'video' || media === 'audio' ? media : undefined;
+
       const ringPayload = {
         callId: String(callId),
         roomId: String(id),
         roomType: access.roomType,
+        media: callMedia,
         from: {
           id: String(userId),
           role: access.role,
@@ -261,7 +271,7 @@ module.exports = function registerCall(io, socket) {
       // Wakes a backgrounded or killed callee. This is the ONLY thing that can
       // ring a phone whose app is not running, so it is not optional garnish.
       sendPush(calleeTokens, {
-        title: 'Incoming call',
+        title: callMedia === 'video' ? 'Incoming video consultation' : 'Incoming call',
         body: `${caller.name || 'Someone'} is calling you`,
         channelId: CALLS_CHANNEL,
         // Expires with the ring itself. A call notification that lands after
@@ -280,6 +290,7 @@ module.exports = function registerCall(io, socket) {
           callId: String(callId),
           roomId: String(id),
           roomType: access.roomType,
+          media: callMedia,
           callerName: caller.name,
         },
       }).catch(() => {});

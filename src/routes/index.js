@@ -6,6 +6,7 @@ const chat = require('../controllers/chatController');
 const conversations = require('../controllers/conversationsController');
 const push = require('../controllers/pushController');
 const turn = require('../controllers/turnController');
+const call = require('../controllers/callController');
 const { emitToRoom } = require('../sockets/io');
 
 const router = express.Router();
@@ -36,6 +37,12 @@ router.delete('/users/me/push-token', protect, push.deletePushToken);
 // Short-lived ICE servers for a WebRTC call. Same user-JWT gate as chat —
 // minting a TURN credential costs relay bandwidth, so it is never anonymous.
 router.get('/turn/credentials', protect, turn.getTurnCredentials);
+
+// Decline a ringing call WITHOUT opening the app. The lock-screen notification's
+// Decline button has no socket to emit over in a backgrounded or killed
+// process, so it posts here instead. Same authorization and same state
+// transition as the socket path — only the transport differs.
+router.post('/calls/:callId/decline', protect, call.declineCall);
 
 // ============================================================================
 // INTERNAL: room-event bridge for the main backend.
