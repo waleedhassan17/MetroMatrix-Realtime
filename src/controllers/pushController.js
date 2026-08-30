@@ -52,8 +52,25 @@ const deletePushToken = asyncHandler(async (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ success: false, message: 'token required' });
 
-  const Model = req.auth.role === 'provider' ? Provider : User;
-  await Model.updateOne({ _id: req.auth.id }, { $pull: { expoPushTokens: token } });
+  // REMOVED FROM BOTH COLLECTIONS, not just the caller's own role.
+  //
+  // A push token is DEVICE-scoped, not account-scoped. savePushToken $addToSets
+  // it onto whichever collection the JWT role selects, so one phone that has
+  // been used by a customer and by a provider ends up with the same token on a
+  // User document AND a Provider document. Scoping the delete to the current
+  // role left the other copy behind — and that device then kept ringing for an
+  // account nobody was signed into any more, with the answer rejected as a
+  // non-participant because the current session's JWT is a different person.
+  //
+  // A token can only ever mean "this device", so signing out should retire it
+  // everywhere. Anyone still signed in on another device re-registers on their
+  // next launch.
+  await Promise.all([
+    User.updateOne({ expoPushTokens: token }, { $pull: { expoPushTokens: token } }),
+    Provider.updateOne({ expoPushTokens: token }, { $pull: { expoPushTokens: token } }),
+  ]);
+
+  console.log(`[push] unregistered token for ${req.auth.role || 'user'}=${req.auth.id}`);
   res.json({ success: true });
 });
 
