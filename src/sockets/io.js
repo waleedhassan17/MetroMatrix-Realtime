@@ -1,4 +1,4 @@
-const { roomKey } = require('./keys');
+const { roomKey, userKey } = require('./keys');
 
 // ============================================================================
 // Holds the Socket.IO server instance.
@@ -28,6 +28,21 @@ function emitToRoom(roomId, event, payload) {
 }
 
 /**
+ * Fan out to one PERSON, across every device they have connected.
+ *
+ * Every socket joins `user:<id>` on connect (see sockets/index.js), which is
+ * what makes this reachable without knowing which screen they are on. Needed
+ * for events about something the recipient is not yet inside — a provider
+ * being told a new booking exists cannot be in that booking's room yet.
+ *
+ * No-ops before the socket server is up, same as emitToRoom.
+ */
+function emitToUser(userId, event, payload) {
+  if (!ioRef || !userId) return;
+  ioRef.to(userKey(userId)).emit(event, payload);
+}
+
+/**
  * Does this user have a socket JOINED TO THIS ROOM right now?
  *
  * Narrower than presence on purpose. Presence answers "are they connected at
@@ -52,4 +67,4 @@ async function isUserInRoom(roomId, userId) {
   }
 }
 
-module.exports = { setIO, getIO, emitToRoom, isUserInRoom };
+module.exports = { setIO, getIO, emitToRoom, emitToUser, isUserInRoom };
