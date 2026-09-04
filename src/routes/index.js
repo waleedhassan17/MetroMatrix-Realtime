@@ -72,7 +72,9 @@ const EMITTABLE_EVENTS = new Set([
   'booking_status_changed',
   'booking_created', // user-targeted: tells a provider a new job is waiting
   'provider_location_update',
-  'payment_requested',
+  'payment_requested', // room-targeted: provider asked the customer to pay
+  'payment_received', // room-targeted: the customer actually paid
+
   // Healthcare
   'appointment_status_changed',
   'payment_status_changed',
