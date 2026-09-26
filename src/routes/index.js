@@ -8,6 +8,8 @@ const push = require('../controllers/pushController');
 const turn = require('../controllers/turnController');
 const call = require('../controllers/callController');
 const { emitToRoom, emitToUser } = require('../sockets/io');
+const { invalidateRoom } = require('../utils/access');
+const { forgetRoom, TRACKABLE_STATUSES } = require('../sockets/trackingHandler');
 const { sendPush } = require('../utils/push');
 const { MESSAGES_CHANNEL } = require('../utils/pushChannels');
 
@@ -104,6 +106,21 @@ router.post('/internal/emit', requireInternalKey, (req, res) => {
       .json({ success: false, message: `Event '${event}' is not emittable` });
   }
 
+  // A status change makes this room's cached access stale — and the cache
+  // holds the booking's STATUS, which the location relay gates on. Without
+  // this, a provider who tapped "Start job" could have every position dropped
+  // as "not trackable" for up to a minute, and one who finished kept being
+  // relayed for up to a minute. Drop the cached access, and once the booking
+  // is no longer trackable drop its last known position too: location is
+  // never retained past the trip (NFR-08).
+  if (roomId && (event === 'booking_status_changed' || event === 'appointment_status_changed')) {
+    invalidateRoom(String(roomId));
+    const status = payload && payload.status;
+    if (event === 'booking_status_changed' && status && !TRACKABLE_STATUSES.includes(status)) {
+      forgetRoom(String(roomId));
+    }
+  }
+
   // No-ops before the socket server is up, which is correct: a publish that
   // arrives during boot is dropped rather than queued, and the client's
   // refetch-on-focus covers it.
@@ -130,7 +147,15 @@ router.post('/internal/emit', requireInternalKey, (req, res) => {
  * Allowlisted by `type` for the same reason `/internal/emit` allowlists
  * events: the key must not become a way to push arbitrary text to any user.
  */
-const PUSHABLE_TYPES = new Set(['booking_created']);
+const PUSHABLE_TYPES = new Set([
+  'booking_created', // provider: a new job request
+  'booking_update', // customer: accepted / declined / on the way / arrived / done;
+  //                   provider: the customer confirmed completion
+  'booking_cancelled', // provider: the customer cancelled
+  'payment_requested', // customer: the provider asked to be paid
+  'payment_received', // provider: paid from the wallet; customer: cash confirmed
+  'payment_update', // provider: the customer chose to pay in cash
+]);
 
 router.post('/internal/push', requireInternalKey, async (req, res) => {
   const { userId, role, type, title, body, data } = req.body || {};
