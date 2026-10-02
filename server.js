@@ -12,6 +12,7 @@ const { assertTurnConfig } = require('./src/controllers/turnController');
 const { verifySharedSchema } = require('./src/utils/verifySchema');
 const { startSweeper, closeAllOnShutdown } = require('./src/services/callService');
 const presence = require('./src/services/presence');
+const { startScheduler, stopScheduler } = require('./src/services/scheduler');
 
 const PORT = process.env.PORT || 5000;
 
@@ -50,7 +51,11 @@ process.on('uncaughtException', (err) => {
     const server = http.createServer(app);
     initSockets(server);
 
-    server.listen(PORT, () => console.log(`[metromatrix-realtime] up on :${PORT}`));
+    server.listen(PORT, () => {
+      console.log(`[metromatrix-realtime] up on :${PORT}`);
+      // The platform clock: reminders and expiry run in the main API, ticked from here.
+      startScheduler();
+    });
 
     // Heroku cycles dynos daily, sends SIGTERM, and hard-kills at 30s.
     let shuttingDown = false;
@@ -66,6 +71,7 @@ process.on('uncaughtException', (err) => {
       }, 25000);
       if (hardStop.unref) hardStop.unref();
 
+      stopScheduler();
       const io = getIO();
       try {
         // Tell clients to reconnect deliberately instead of stampeding.

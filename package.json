@@ -1,7 +1,7 @@
 {
   "name": "metromatrix-realtime",
   "version": "1.0.0",
-  "description": "MetroMatrix realtime service — chat + call signalling over Socket.IO. Shares MongoDB and JWT_SECRET with the main backend; the two services never call each other.",
+  "description": "MetroMatrix realtime service: chat, call signalling and push over Socket.IO. Shares MongoDB and JWT_SECRET with the main backend; the two call each other only through key-protected /api/internal routes.",
   "main": "server.js",
   "engines": {
     "node": ">=18"
@@ -11,7 +11,8 @@
     "dev": "nodemon server.js",
     "ensure-indexes": "node scripts/ensureIndexes.js",
     "verify-token": "node scripts/verifyToken.js",
-    "verify-realtime": "node scripts/verifyPresenceAndCalls.js"
+    "verify-realtime": "node scripts/verifyPresenceAndCalls.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

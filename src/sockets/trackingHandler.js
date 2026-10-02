@@ -1,6 +1,8 @@
 const { resolveRoom } = require('../utils/access');
 const { safeHandler } = require('./safeHandler');
 const { emitToRoom } = require('./io');
+const { haversineMeters, etaMinutes, shouldNotifyNearby, destinationOf } = require('../utils/nearby');
+const { callMainApi } = require('../utils/mainApi');
 
 // ============================================================================
 // Provider location sharing (live tracking).
@@ -51,9 +53,33 @@ function getLastLocation(roomId) {
   return lastByRoom.get(String(roomId))?.payload || null;
 }
 
+/**
+ * Rooms whose "about 5 minutes away" alert this process already asked for.
+ * Only a cheap local guard against asking on every sample — the main API's
+ * atomic claim is what guarantees exactly once.
+ */
+const nearbyAsked = new Set();
+
 /** Membership can change; drop the retained position with it. */
 function forgetRoom(roomId) {
   lastByRoom.delete(String(roomId));
+  nearbyAsked.delete(String(roomId));
+}
+
+/** Fire-and-forget: ask the main API to send the nearby alert for this booking. */
+function maybeAlertNearby(roomId, booking, position) {
+  const id = String(roomId);
+  if (nearbyAsked.has(id)) return;
+  const dest = destinationOf(booking);
+  if (!dest) return; // never alert against an address the customer did not pin
+  const meters = haversineMeters(position, dest);
+  if (!shouldNotifyNearby(meters)) return;
+  if (nearbyAsked.size >= CACHE_MAX) nearbyAsked.delete(nearbyAsked.values().next().value);
+  nearbyAsked.add(id);
+  callMainApi(`/api/internal/homeservice/bookings/${id}/nearby`, {
+    distanceMeters: meters,
+    etaMinutes: etaMinutes(meters),
+  }).then((r) => console.log(`[tracking] nearby room=${id} ${meters}m → ${r.ok ? JSON.stringify(r.data) : r.reason || r.status}`));
 }
 
 function registerTracking(io, socket) {
@@ -115,6 +141,10 @@ function registerTracking(io, socket) {
       rememberLocation(String(id), broadcast);
       emitToRoom(id, 'provider_location_update', broadcast);
 
+      if (access.status === 'EN_ROUTE') {
+        maybeAlertNearby(id, access.room, { latitude: finalLat, longitude: finalLng });
+      }
+
       return ack?.({ success: true, data: { broadcast: true } });
     })
   );
@@ -125,3 +155,4 @@ module.exports.getLastLocation = getLastLocation;
 module.exports.forgetRoom = forgetRoom;
 module.exports.TRACKABLE_STATUSES = TRACKABLE_STATUSES;
 module.exports.THROTTLE_MS = THROTTLE_MS;
+module.exports.maybeAlertNearby = maybeAlertNearby;

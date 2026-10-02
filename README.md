@@ -10,16 +10,30 @@ and cannot hold a WebSocket open.
 
 ## The consistency contract
 
-The two backends **never call each other**. They stay consistent by sharing
-exactly two values, which must be byte-identical to the main backend's:
+The two backends share data, not code. Two values must be byte-identical to
+the main backend's:
 
 | Var | Why |
 |---|---|
 | `MONGODB_URI` | Same cluster **and** same database (`metromatrix`) |
 | `JWT_SECRET` | Main signs the token at login; this service verifies it |
 
-That is the whole integration. A user logs in against the main API, and the
-token they already hold is accepted here as-is.
+A user logs in against the main API, and the token they already hold is
+accepted here as-is.
+
+They DO call each other, server to server, over a narrow bridge guarded by a
+third shared value, `INTERNAL_API_KEY` (`x-internal-key` header):
+
+| Direction | Route | Why |
+|---|---|---|
+| main → realtime | `POST /api/internal/emit` | room / per-user socket events (booking + appointment status, payments, nearby) — allow-listed |
+| main → realtime | `POST /api/internal/push` | push to a user's devices via Expo (FCM on Android) — allow-listed by type (`PUSHABLE_TYPES` in `src/routes/index.js`, incl. `identity_verified`) |
+| main → realtime | `GET /api/internal/stats` | live usage counts for the admin dashboard (no identities) |
+| realtime → main | `POST /api/internal/homeservice/bookings/:id/nearby` | the provider's live position is ~5 min from the customer (positions are never stored, so only this service can see it) |
+| realtime → main | `POST /api/internal/scheduler/tick` | every ~5 min: reminders and expiry (Vercel has no long-lived process) |
+
+The main API owns every notification and its exactly-once claim; this service
+only detects and relays.
 
 Because nothing enforces that the two schemas stay aligned, `src/utils/verifySchema.js`
 samples every shared collection at boot and warns loudly on drift:
@@ -144,6 +158,9 @@ never learns whether the room exists.
 | `webrtc_offer` / `webrtc_answer` / `webrtc_ice` | peer | relayed verbatim, never inspected |
 | `token_expired` | socket | sent before disconnecting an expired session |
 | `server_shutdown` | all | `{ reconnectInMs }` — dyno cycling |
+| `booking_status_changed` / `payment_requested` / `payment_received` / `payment_status_changed` | room | relayed from the main API (`/api/internal/emit`) |
+| `provider_nearby` | room | `{ bookingId, etaMinutes, distanceMeters }` — once per trip |
+| `identity_verified` | room | `{ bookingId, method: 'nfc'\|'qr'\|'code', verifiedAt }` — the customer checked the provider's ID at the door |
 
 `call_busy` goes to the caller alone; broadcasting it would tell the busy callee
 about a ring they never received.

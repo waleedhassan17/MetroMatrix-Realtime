@@ -76,6 +76,8 @@ const EMITTABLE_EVENTS = new Set([
   'provider_location_update',
   'payment_requested', // room-targeted: provider asked the customer to pay
   'payment_received', // room-targeted: the customer actually paid
+  'provider_nearby', // room-targeted: the provider is ~5 minutes away
+  'identity_verified', // room-targeted: the customer verified the provider at the door
 
   // Healthcare
   'appointment_status_changed',
@@ -155,7 +157,32 @@ const PUSHABLE_TYPES = new Set([
   'payment_requested', // customer: the provider asked to be paid
   'payment_received', // provider: paid from the wallet; customer: cash confirmed
   'payment_update', // provider: the customer chose to pay in cash
+  'booking_nearby', // customer: the provider is about 5 minutes away
+  'booking_reminder', // both: an accepted job starts within the hour
+  'review_received', // provider: a customer reviewed a finished job
+  'identity_verified', // provider: the customer confirmed their identity at the door
+
+  // Healthcare — every appointment notice in the inbox also arrives as a push.
+  'appointment_update', // booked / confirmed / cancelled / rescheduled / completed
+  'appointment_reminder', // patient: in about an hour
+  'prescription_ready', // patient
+  'video_call_starting', // patient: in about 5 minutes
+
+  // Shopping
+  'order_created', // vendor: a new order for their brand
+  'order_update', // customer: confirmed / shipped / out for delivery / delivered / cancelled / refunded
+  'return_update', // vendor: a return was requested
+  'product_moderation', // vendor: a product was approved / rejected / removed
 ]);
+
+/** How long a push is worth delivering late. A reminder after the event is noise. */
+const PUSH_TTL_SECONDS = {
+  video_call_starting: 15 * 60,
+  booking_nearby: 15 * 60,
+  identity_verified: 15 * 60,
+  appointment_reminder: 2 * 60 * 60,
+  booking_reminder: 2 * 60 * 60,
+};
 
 router.post('/internal/push', requireInternalKey, async (req, res) => {
   const { userId, role, type, title, body, data } = req.body || {};
@@ -184,11 +211,16 @@ router.post('/internal/push', requireInternalKey, async (req, res) => {
         title,
         body: body || '',
         channelId: MESSAGES_CHANNEL,
-        // One entry per booking — a retry updates rather than stacks.
-        collapseKey: `${type}:${(data && data.bookingId) || userId}`,
-        // A day. A job request older than that belongs in the app, not in a
-        // notification arriving out of nowhere.
-        ttlSeconds: 86400,
+        // One entry per booking / appointment / order — a retry or the next
+        // status updates the notification rather than stacking. Keyed on the
+        // entity, or all of one user's appointment (or order) pushes would
+        // replace each other.
+        collapseKey: `${type}:${
+          (data && (data.bookingId || data.appointmentId || data.orderId)) || userId
+        }`,
+        // A day by default. A job request older than that belongs in the app,
+        // not in a notification arriving out of nowhere.
+        ttlSeconds: PUSH_TTL_SECONDS[type] || 86400,
         data: { type, ...(data || {}) },
       });
       console.log(`[internal] push ${type} user=${userId}`);
@@ -202,5 +234,38 @@ router.post('/internal/push', requireInternalKey, async (req, res) => {
   return res.status(204).end();
 });
 
+/**
+ * Live usage, for the admin dashboard's "right now" tiles (the main API's
+ * /api/admin/analytics/realtime reads this). Counts only — no identities.
+ */
+router.get('/internal/stats', requireInternalKey, (req, res) => {
+  const { getIO } = require('../sockets/io');
+  const presence = require('../services/presence');
+  const { activeCalls } = require('../services/callService');
+  const byRole = { user: 0, provider: 0, admin: 0, other: 0 };
+  const seen = new Set();
+  const io = getIO();
+  if (io) {
+    for (const socket of io.of('/').sockets.values()) {
+      const uid = socket.data && socket.data.userId;
+      if (!uid || seen.has(uid)) continue;
+      seen.add(uid);
+      const role = socket.data.userType;
+      byRole[byRole[role] !== undefined ? role : 'other'] += 1;
+    }
+  }
+  res.json({
+    success: true,
+    data: {
+      onlineAccounts: presence.onlineCount(),
+      onlineByRole: byRole,
+      activeCalls: new Set([...activeCalls.values()].map((c) => c && c.callId).filter(Boolean)).size,
+      uptimeSeconds: Math.round(process.uptime()),
+      at: new Date().toISOString(),
+    },
+  });
+});
+
 module.exports = router;
 module.exports.EMITTABLE_EVENTS = EMITTABLE_EVENTS;
+module.exports.PUSHABLE_TYPES = PUSHABLE_TYPES;
